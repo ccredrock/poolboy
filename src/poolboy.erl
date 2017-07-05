@@ -31,6 +31,7 @@
 -record(state, {
     supervisor :: pid(),
     workers :: [pid()],
+    deads = 0:: non_neg_integer(),
     waiting :: pid_queue(),
     monitors :: ets:tid(),
     size = 5 :: non_neg_integer(),
@@ -180,6 +181,7 @@ handle_cast(_Msg, State) ->
 handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
     #state{supervisor = Sup,
            workers = Workers,
+           deads = Deads,
            monitors = Monitors,
            overflow = Overflow,
            max_overflow = MaxOverflow} = State,
@@ -188,10 +190,22 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             {reply, Pid, State#state{workers = Left}};
+        [] when Deads > 0 ->
+            case catch new_worker(Sup, FromPid) of
+                {'EXIT', _Reason} ->
+                    {reply, full, State};
+                {Pid, MRef} ->
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, Pid, State#state{deads = Deads - 1}}
+            end;
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
-            {Pid, MRef} = new_worker(Sup, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
+            case catch new_worker(Sup, FromPid) of
+                {'EXIT', _Reason} ->
+                    {reply, full, State};
+                {Pid, MRef} ->
+                    true = ets:insert(Monitors, {Pid, CRef, MRef}),
+                    {reply, Pid, State#state{overflow = Overflow + 1}}
+            end;
         [] when Block =:= false ->
             {reply, full, State};
         [] ->
@@ -235,6 +249,7 @@ handle_info({'DOWN', MRef, _, _, _}, State) ->
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{supervisor = Sup,
+           deads = Deads,
            monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, _, MRef}] ->
@@ -246,7 +261,10 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case lists:member(Pid, State#state.workers) of
                 true ->
                     W = lists:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = [new_worker(Sup) | W]}};
+                    case catch new_worker(Sup) of
+                        {'EXIT', _Reason} -> {noreply, State#state{deads = Deads + 1}};
+                        Worker -> {noreply, State#state{workers = [Worker | W]}}
+                    end;
                 false ->
                     {noreply, State}
             end
@@ -320,20 +338,26 @@ handle_checkin(Pid, State) ->
 handle_worker_exit(Pid, State) ->
     #state{supervisor = Sup,
            monitors = Monitors,
+           deads = Deads,
            overflow = Overflow} = State,
     case queue:out(State#state.waiting) of
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
-            NewWorker = new_worker(State#state.supervisor),
-            true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
-            gen_server:reply(From, NewWorker),
-            State#state{waiting = LeftWaiting};
+            case catch new_worker(Sup) of
+                {'EXIT', _Reason} ->
+                    State#state{deads = Deads + 1};
+                NewWorker ->
+                    true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
+                    gen_server:reply(From, NewWorker),
+                    State#state{waiting = LeftWaiting}
+            end;
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
         {empty, Empty} ->
-            Workers =
-                [new_worker(Sup)
-                 | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
-            State#state{workers = Workers, waiting = Empty}
+            W = lists:filter(fun (P) -> P =/= Pid end, State#state.workers),
+            case catch new_worker(Sup) of
+                {'EXIT', _Reason} -> State#state{deads = Deads + 1, waiting = Empty};
+                Worker -> State#state{workers = [Worker | W], waiting = Empty}
+            end
     end.
 
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
